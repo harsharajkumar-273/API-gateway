@@ -1,26 +1,28 @@
 <div align="center">
 
-# 🛡️ Production API Gateway & SRE Circuit Breaker
+# 🛡️ API Gateway Prototype & Circuit Breaker
 
-**A high-throughput, edge reverse proxy with atomic Redis sliding-window rate limiters and custom SRE Circuit Breakers.**  
-*Sustains 25,000+ req/sec at P99 < 15ms while protecting downstream microservices against cascading failures and traffic spikes.*
+**A reverse-proxy prototype with atomic Redis sliding-window rate limiters and a custom circuit breaker.**  
+*Built to learn gateway reliability patterns — rate limiting, fault isolation, and fallback responses. Not a production system.*
 
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg?style=for-the-badge&logo=nodedotjs)](https://nodejs.org)
 [![Express](https://img.shields.io/badge/Express-4.x-black.svg?style=for-the-badge&logo=express)](https://expressjs.com)
 [![Redis](https://img.shields.io/badge/Redis-ZSets-red.svg?style=for-the-badge&logo=redis)](https://redis.io)
 [![Docker](https://img.shields.io/badge/Docker-Supported-blue.svg?style=for-the-badge&logo=docker)](https://www.docker.com/)
-[![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-orange.svg?style=for-the-badge&logo=prometheus)](https://prometheus.io/)
+[![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-orange.svg?style=for-the-badge&logo=prometheus)](https://prometheus.io)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 
 </div>
 
+> **Accuracy note (Nov 2026):** This is a learning prototype, not a production system. It has not been load-tested, and earlier versions of this README presented aspirational throughput/latency figures as measured benchmarks — those numbers have been removed. Authentication in the code is a mock-token check; real JWT verification is a roadmap item (Issue #3).
+
 ---
 
-> ### 🚀 HERO PERFORMANCE BENCHMARKS
-> * **Sustained Peak Throughput**: **25,400+ requests/sec**
-> * **P99 Latency SLA**: **< 15.0 ms** under full traffic saturation (**P50**: **4.2 ms**)
-> * **Redis Rate-Limiting Overhead**: **< 1.5 ms** per check via atomic Redis Sorted Set (`zset`) pipelines
-> * **Circuit Breaker Trip Latency**: Fast-fallback static payload served in **< 0.8 ms** during downstream outages
+> ### 📌 WHAT'S IMPLEMENTED
+> * **Rate limiting**: sliding window backed by Redis Sorted Sets (atomic MULTI/EXEC pipeline)
+> * **Circuit breaker**: CLOSED → OPEN → HALF-OPEN state machine with static fallback responses
+> * **Auth**: mock-token check for development — real JWT verification is a roadmap item (Issue #3 below)
+> * **Performance**: not load-tested; no throughput or latency figures are claimed
 
 ---
 
@@ -29,17 +31,17 @@
 * **The Bottleneck (Why microservices crash during traffic bursts)**:  
   When a downstream database or authentication service slows down, incoming HTTP requests pile up, exhausting thread pools and socket descriptors. Naive rate limiters using fixed time windows allow double-capacity traffic spikes right at the window boundary, leading to cascading service failures across the entire cluster.
 * **The Low-Level Fix (How we solved it)**:  
-  This gateway protects upstream infrastructure using an **Atomic Sliding-Window Rate Limiter** backed by **Redis Sorted Sets (`zsets`)**. Every request executes inside a Redis MULTI/EXEC transaction (`ZREMRANGEBYSCORE`, `ZADD`, `ZCARD`), eliminating window boundary spikes. For fault isolation, a custom **SRE Circuit Breaker state machine (CLOSED → OPEN → HALF-OPEN)** intercepts downstream timeouts, immediately serving fast fallback responses in **< 0.8ms** without starving node event loops.
+  This gateway protects upstream infrastructure using an **Atomic Sliding-Window Rate Limiter** backed by **Redis Sorted Sets (`zsets`)**. Every request executes inside a Redis MULTI/EXEC transaction (`ZREMRANGEBYSCORE`, `ZADD`, `ZCARD`), eliminating window boundary spikes. For fault isolation, a custom **SRE Circuit Breaker state machine (CLOSED → OPEN → HALF-OPEN)** intercepts downstream timeouts, immediately serving fast fallback responses without starving node event loops.
 
 ---
 
 ## 🛠️ How It Was Achieved (Engineering Deep-Dive)
 
-To sustain **25,400+ req/sec** with P99 < 15ms latency, three key reliability and rate-limiting components were built:
+Three key reliability and rate-limiting components were built:
 
 ### 1. Atomic Redis Sorted Set (`zset`) Sliding Window Limiter
 - **Eliminating Boundary Spikes**: Traditional fixed-window limiters reset counters every 60s, allowing 2x limit bursts right at boundary transitions. Our sliding window algorithm stores timestamps as scores in a Redis `zset`.
-- **Atomic MULTI/EXEC Pipeline**: Checks and mutations execute atomically in a single Redis roundtrip (< 1.5ms):
+- **Atomic MULTI/EXEC Pipeline**: Checks and mutations execute atomically in a single Redis roundtrip:
   1. `ZREMRANGEBYSCORE key 0 (now - window)`: Prunes requests older than the sliding window.
   2. `ZADD key now unique_id`: Records the current request timestamp.
   3. `ZCARD key`: Counts total active requests within the rolling window.
@@ -65,7 +67,7 @@ if (requestCount > MAX_REQUESTS) {
 
 ### 2. SRE Circuit Breaker Pattern (CLOSED → OPEN → HALF-OPEN)
 - **Ring Buffer Error Tracking**: Maintains a sliding 100-request window tracking HTTP 5xx responses and timeouts.
-- **Fast-Path Circuit Tripping**: When failure rates exceed 50%, the state transitions to `OPEN`. All incoming requests for that route bypass downstream calls entirely, returning static fallback responses in **< 0.8ms**.
+- **Fast-Path Circuit Tripping**: When failure rates exceed 50%, the state transitions to `OPEN`. All incoming requests for that route bypass downstream calls entirely, returning static fallback responses.
 - **Canary Recovery (`HALF-OPEN`)**: After a 10s cooldown, 5 canary probe requests test downstream health. If all pass, state returns to `CLOSED`.
 
 ### 3. Adaptive EWMA PID Load Controller
@@ -82,7 +84,7 @@ stateDiagram-v2
     
     CLOSED --> OPEN: Error Rate > 50% OR Timeout Spike
     note right of OPEN
-        Fast-Fallback Active (0.8ms Latency)
+        Fast-Fallback Active
         Downstream Calls Blocked
         SLO Error Budget Preserved
     end note
@@ -132,16 +134,9 @@ sequenceDiagram
 
 ---
 
-## 📊 Empirical Benchmarks
+## 📊 Benchmarks
 
-Benchmarked using `autocannon` load testing (100 concurrent connections, 60s test runs):
-
-| Scenario | Mode / Strategy | Throughput | P50 Latency | P99 Latency | Failover / Behavior |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Normal Load** | Direct Proxy Pass-Through | **25,400 req/sec** | **4.2 ms** | **14.8 ms** | 100% 200 OK |
-| **Traffic Spike** | **Redis ZSet Rate Limiter**| **24,100 req/sec** | **4.8 ms** | **16.2 ms** | Smooth 429 Throttling |
-| **Downstream Outage**| **Circuit Breaker OPEN** | **38,200 req/sec** | **0.4 ms** | **0.8 ms** | **Fast Fallback (0 Server Stalls)**|
-| Naive Fixed Window | In-Memory Counter | 12,000 req/sec | 18.5 ms | 145.0 ms | Boundary Burst Crashes |
+No load-test results are published for this project. An earlier version of this README included an autocannon results table whose figures were not produced by a recorded test run; the table has been removed rather than presented as data.
 
 ---
 
